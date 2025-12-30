@@ -1,8 +1,8 @@
 _base_ = [
-    '../../_base_/models/segformer.py',
-    '../../_base_/datasets/apolloscape_480x480_clips.py',
-    '../../_base_/default_runtime.py',
-    '../../_base_/schedules/schedule_160k_adamw.py'
+    '../../../_base_/models/segformer.py',
+    '../../../_base_/datasets/cityscapes_corruptions_736x1280_clips.py',
+    '../../../_base_/default_runtime.py',
+    '../../../_base_/schedules/schedule_160k_adamw.py'
 ]
 
 # model settings
@@ -43,7 +43,6 @@ lr_config = dict(_delete_=True, policy='poly',
                  warmup_iters=1500,
                  warmup_ratio=1e-6,
                  power=1.0, min_lr=0.0, by_epoch=False)
-
 
 data = dict(samples_per_gpu=1)
 runner = dict(type='IterBasedRunner', max_iters=240000)
