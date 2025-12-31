@@ -90,7 +90,7 @@ def parse_args():
         "--no-write-res",
         dest="write_res",
         action="store_false",
-        help="Do not write prediction masks",
+        help="Do not write prediction masks (default)",
     )
     parser.add_argument(
         "--metrics-only",
@@ -100,9 +100,9 @@ def parse_args():
     parser.add_argument(
         "--metrics-on",
         action="store_true",
-        help="Alias flag for enabling metrics (default behavior).",
+        help="No-op (metrics are always computed); kept for compatibility.",
     )
-    parser.set_defaults(write_res=True)
+    parser.set_defaults(write_res=False)
     return parser.parse_args()
 
 
