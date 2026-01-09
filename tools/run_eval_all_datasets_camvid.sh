@@ -19,7 +19,7 @@ run_eval() {
     "${cfg}" "${CKPT}" \
     --save-dir "${out_dir}" \
     --split val \
-    --write-res
+    --metrics-only
 }
 
 run_eval "apollo" "local_configs/tv3s/B5/tv3s_realshift_w20_s10.b5.480x480.apollo15.160k.py"

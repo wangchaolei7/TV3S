@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+from datetime import timedelta
 from functools import partial
 
 import mmcv
@@ -123,7 +124,21 @@ def parse_args():
 def init_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
+        timeout = None
+        timeout_env = os.environ.get("DIST_TIMEOUT")
+        if timeout_env:
+            try:
+                timeout_seconds = float(timeout_env)
+            except ValueError:
+                timeout_seconds = None
+            if timeout_seconds and timeout_seconds > 0:
+                timeout = timedelta(seconds=timeout_seconds)
+        if timeout is not None:
+            dist.init_process_group(
+                backend="nccl", init_method="env://", timeout=timeout
+            )
+        else:
+            dist.init_process_group(backend="nccl", init_method="env://")
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local_rank)
         return True
@@ -237,12 +252,25 @@ class SequenceDistributedSampler(Sampler):
         seq_to_indices = _build_sequence_indices(self.dataset)
         if not seq_to_indices:
             return list(range(len(self.dataset)))
-        seq_keys = sorted(seq_to_indices.keys())
-        rank_seq_keys = seq_keys[self.rank :: self.world_size]
-        indices = []
-        for key in rank_seq_keys:
-            indices.extend(seq_to_indices[key])
-        return indices
+        if self.world_size <= 1:
+            indices = []
+            for key in sorted(seq_to_indices.keys()):
+                indices.extend(seq_to_indices[key])
+            return indices
+
+        seq_items = [(key, seq_to_indices[key]) for key in seq_to_indices.keys()]
+        seq_items.sort(key=lambda x: (-len(x[1]), x[0]))
+
+        rank_loads = [0 for _ in range(self.world_size)]
+        rank_indices = [[] for _ in range(self.world_size)]
+        for key, idxs in seq_items:
+            target_rank = min(
+                range(self.world_size), key=lambda r: (rank_loads[r], r)
+            )
+            rank_indices[target_rank].extend(idxs)
+            rank_loads[target_rank] += len(idxs)
+
+        return rank_indices[self.rank]
 
     def __iter__(self):
         return iter(self._indices)
@@ -675,18 +703,19 @@ def main():
     reduce_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ann_map = {}
-    seg_suffix = getattr(dataset, "seg_map_suffix", None)
-    img_suffix = getattr(dataset, "img_suffix", None)
-    if dataset.ann_dir and seg_suffix and img_suffix:
-        for ann_rel in mmcv.scandir(dataset.ann_dir, seg_suffix, recursive=True):
-            img_rel = ann_rel[: -len(seg_suffix)] + img_suffix
-            ann_map[img_rel] = ann_rel
-    else:
-        for info in getattr(dataset, "img_infos", []):
-            rel = info.get("filename")
-            seg = info.get("ann", {}).get("seg_map")
-            if rel is not None and seg is not None:
-                ann_map[rel] = seg
+    for info in getattr(dataset, "img_infos", []):
+        rel = info.get("filename")
+        seg = info.get("ann", {}).get("seg_map")
+        if rel is not None and seg is not None:
+            ann_map[rel] = seg
+
+    if not ann_map:
+        seg_suffix = getattr(dataset, "seg_map_suffix", None)
+        img_suffix = getattr(dataset, "img_suffix", None)
+        if dataset.ann_dir and seg_suffix and img_suffix:
+            for ann_rel in mmcv.scandir(dataset.ann_dir, seg_suffix, recursive=True):
+                img_rel = ann_rel[: -len(seg_suffix)] + img_suffix
+                ann_map[img_rel] = ann_rel
 
     total = len(sampler) if sampler is not None else len(dataset)
     prog_bar = mmcv.ProgressBar(total) if is_main_process() else None
