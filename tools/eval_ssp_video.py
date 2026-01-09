@@ -26,13 +26,6 @@ if os.path.isdir(SSP_ROOT) and SSP_ROOT not in sys.path:
     sys.path.insert(0, SSP_ROOT)
 
 try:
-    from RAFT_core.raft import RAFT
-except Exception as exc:
-    raise ImportError(
-        "Failed to import RAFT from SSP. Set SSP_ROOT or ensure "
-        "/home/wangcl/SSP is available."
-    ) from exc
-try:
     from vis_utils.visualization import (
         color_predictions,
         inverse_normalize,
@@ -46,29 +39,50 @@ except Exception as exc:
 
 EVAL_CROP_SIZE = (480, 480)
 
-SSP_COLORS_15 = {
-    0: (0, 0, 0),
-    1: (128, 64, 128),
-    2: (244, 35, 232),
-    3: (70, 70, 70),
-    4: (102, 102, 156),
-    5: (190, 153, 153),
-    6: (153, 153, 153),
-    7: (250, 170, 30),
-    8: (220, 220, 0),
-    9: (107, 142, 35),
-    10: (152, 251, 152),
-    11: (70, 130, 180),
-    12: (220, 20, 60),
-    13: (255, 0, 0),
-    14: (0, 0, 142),
-    15: (0, 60, 100),
-}
+MVC_STRIDE = 4
+MVC_N_LIST = (8, 16)
+CITYS_SIM_THRESH = 20.0
+
+CLASSES_15 = (
+    "road",
+    "sidewalk",
+    "building",
+    "wall",
+    "fence",
+    "pole",
+    "traffic light",
+    "traffic sign",
+    "vegetation",
+    "sky",
+    "person",
+    "rider",
+    "car",
+    "Truck_Bus",
+    "motorcycle",
+)
+
+PALETTE_15 = [
+    [128, 64, 128],
+    [244, 35, 232],
+    [70, 70, 70],
+    [102, 102, 156],
+    [190, 153, 153],
+    [153, 153, 153],
+    [250, 170, 30],
+    [220, 220, 0],
+    [107, 142, 35],
+    [70, 130, 180],
+    [220, 20, 60],
+    [255, 0, 0],
+    [0, 0, 142],
+    [0, 60, 100],
+    [0, 0, 230],
+]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="TV3S eval with SSP-style metrics (mIoU + TC + per-class mIoU)."
+        description="TV3S eval with OVDG-style metrics (mIoU/mAcc/aAcc + mVC)."
     )
     parser.add_argument("config", help="Config file path")
     parser.add_argument("checkpoint", help="Checkpoint file path")
@@ -157,59 +171,24 @@ def _iou_from_confusion(confusion):
     return iou, union
 
 
-def _mean_iou(pred, label, n_classes, ignore_index):
-    confusion = torch.zeros((n_classes, n_classes), dtype=torch.int64)
-    confusion = _update_confusion(confusion, pred, label, n_classes, ignore_index)
-    iou, union = _iou_from_confusion(confusion)
-    valid = union > 0
-    return iou[valid].mean() if valid.any() else torch.tensor(0.0)
-
-
-def flowwarp(x, flo):
-    b, c, h, w = x.size()
-    xx = torch.arange(0, w).view(1, -1).repeat(h, 1)
-    yy = torch.arange(0, h).view(-1, 1).repeat(1, w)
-    xx = xx.view(1, 1, h, w).repeat(b, 1, 1, 1)
-    yy = yy.view(1, 1, h, w).repeat(b, 1, 1, 1)
-    grid = torch.cat((xx, yy), 1).float()
-    if x.is_cuda:
-        grid = grid.to(x.device)
-    vgrid = grid + flo
-    vgrid[:, 0, :, :] = 2.0 * vgrid[:, 0, :, :].clone() / max(w - 1, 1) - 1.0
-    vgrid[:, 1, :, :] = 2.0 * vgrid[:, 1, :, :].clone() / max(h - 1, 1) - 1.0
-    vgrid = vgrid.permute(0, 2, 3, 1)
-    output = torch.nn.functional.grid_sample(
-        x, vgrid, mode="nearest", align_corners=False
-    )
-    return output
-
-
-def temporal_consistency_pair(
-    frame, next_frame, pred, next_pred, model_raft, n_classes, device, ignore_index
-):
-    frame = torch.from_numpy(frame).unsqueeze(0).to(device)
-    next_frame = torch.from_numpy(next_frame).unsqueeze(0).to(device)
-    with torch.no_grad():
-        model_raft.eval()
-        _, flow = model_raft(frame, next_frame, iters=20, test_mode=True)
-    flow = flow.detach().cpu()
-    pred = torch.from_numpy(pred)
-    next_pred = torch.from_numpy(next_pred)
-    next_pred = next_pred.unsqueeze(0).unsqueeze(0).float()
-    warp_pred = flowwarp(next_pred, flow).int().squeeze(1)
-    pred = pred.unsqueeze(0)
-    return _mean_iou(warp_pred, pred, n_classes, ignore_index)
-
-
-def get_flow_model(raft_weights):
-    model_raft = RAFT()
-    state = torch.load(raft_weights, map_location="cpu", weights_only=True)
-    new_state = {}
-    for k, v in state.items():
-        name = k[7:] if k.startswith("module.") else k
-        new_state[name] = v
-    model_raft.load_state_dict(new_state)
-    return model_raft
+def _summarize_confusion(confusion):
+    conf = confusion.astype(np.float64)
+    gt_sum = conf.sum(axis=1)
+    pred_sum = conf.sum(axis=0)
+    intersect = np.diag(conf)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        acc = intersect / gt_sum
+        iou = intersect / (gt_sum + pred_sum - intersect)
+    total = conf.sum()
+    a_acc = float(intersect.sum() / total) if total > 0 else float("nan")
+    valid_mask = ~(np.isnan(acc) | (iou == 0))
+    if valid_mask.any():
+        m_acc = float(np.nanmean(acc[valid_mask]))
+        m_iou = float(np.nanmean(iou[valid_mask]))
+    else:
+        m_acc = float("nan")
+        m_iou = float("nan")
+    return a_acc, m_acc, m_iou, acc, iou
 
 
 def _infer_sequence_key(rel_path):
@@ -221,6 +200,15 @@ def _infer_sequence_key(rel_path):
         camera = f"Camera_{match.group(1)}"
         return os.path.join(seq_dir, camera) if seq_dir else camera
     return seq_dir if seq_dir else ""
+
+
+def _is_cityscapes_sequence(path):
+    if not path:
+        return False
+    return (
+        "origin_leftImg8bit_sequence" in path
+        or "leftImg8bit_sequence_Corruptions" in path
+    )
 
 
 def _build_sequence_indices(dataset):
@@ -311,6 +299,206 @@ def _load_raw_frame(img_path, to_rgb, target_hw=None):
     return img.transpose(2, 0, 1)
 
 
+class MVCTracker:
+    def __init__(self, ignore_index, stride=4, mvc_n=(8, 16), citys_sim_thresh=20.0):
+        self.ignore_index = int(ignore_index)
+        self.stride = max(1, int(stride))
+        self.mvc_n_list = sorted({max(1, int(x)) for x in mvc_n})
+        self.citys_sim_thresh = float(citys_sim_thresh)
+        self.seq_cache = {}
+        self.last_seq_key = None
+        self.mvc_sum = {n: 0.0 for n in self.mvc_n_list}
+        self.mvc_cnt = {n: 0 for n in self.mvc_n_list}
+
+    def _downsample(self, arr):
+        if arr is None:
+            return None
+        if arr.ndim == 3:
+            arr = arr[:, :, 0]
+        if self.stride > 1:
+            return arr[:: self.stride, :: self.stride]
+        return arr
+
+    def _load_small_gray_image(self, img_path, h_small, w_small):
+        try:
+            img = Image.open(img_path).convert("L")
+        except Exception:
+            return None
+        img = img.resize((w_small, h_small), Image.BILINEAR)
+        return np.array(img, dtype=np.uint8)
+
+    def _compute_vc_dense(self, preds, gts, n):
+        length = len(preds)
+        if length < n:
+            return None
+        vals = []
+        for start in range(0, length - n + 1):
+            pred_win = preds[start : start + n]
+            gt_win = gts[start : start + n]
+
+            gt0 = gt_win[0]
+            gt_equal = np.ones(gt0.shape, dtype=bool)
+            gt_valid = np.ones(gt0.shape, dtype=bool)
+            for gt in gt_win:
+                gt_valid &= gt != self.ignore_index
+            for gt in gt_win[1:]:
+                gt_equal &= gt == gt0
+            gt_common = gt_equal & gt_valid
+            denom = int(gt_common.sum())
+            if denom == 0:
+                continue
+
+            pred0 = pred_win[0]
+            pred_equal = np.ones(pred0.shape, dtype=bool)
+            for pred in pred_win[1:]:
+                pred_equal &= pred == pred0
+
+            num = int((gt_common & pred_equal & (pred0 == gt0)).sum())
+            vals.append(num / denom)
+        if not vals:
+            return None
+        return float(np.mean(vals))
+
+    def _compute_vc_sparse_by_valid_windows(self, preds, gts, n):
+        length = len(preds)
+        if length < n:
+            return None
+        vals = []
+        for start in range(0, length - n + 1):
+            gt_win = gts[start : start + n]
+            if any(x is None for x in gt_win):
+                continue
+            vc = self._compute_vc_dense(
+                preds[start : start + n],
+                [x for x in gt_win if x is not None],
+                n,
+            )
+            if vc is not None:
+                vals.append(vc)
+        if not vals:
+            return None
+        return float(np.mean(vals))
+
+    def _compute_vc_citys_sparse(self, preds, imgs, ref_gt, ref_img, n):
+        length = len(preds)
+        if length < n:
+            return None
+        if ref_gt is None or ref_img is None:
+            return None
+        if len(imgs) != length:
+            return None
+        if any(img is None for img in imgs):
+            return None
+
+        vals = []
+        ref_gt_valid = ref_gt != self.ignore_index
+        for start in range(0, length - n + 1):
+            pred_win = preds[start : start + n]
+            img_win = imgs[start : start + n]
+
+            static_all = np.ones(ref_img.shape, dtype=bool)
+            for img_t in img_win:
+                diff = np.abs(img_t.astype(np.int16) - ref_img.astype(np.int16))
+                static_all &= diff <= self.citys_sim_thresh
+
+            m_common = static_all & ref_gt_valid
+            denom = int(m_common.sum())
+            if denom == 0:
+                continue
+
+            pred0 = pred_win[0]
+            pred_equal = np.ones(pred0.shape, dtype=bool)
+            for pred in pred_win[1:]:
+                pred_equal &= pred == pred0
+
+            num = int((m_common & pred_equal & (pred0 == ref_gt)).sum())
+            vals.append(num / denom)
+        if not vals:
+            return None
+        return float(np.mean(vals))
+
+    def update(self, seq_key, pred, gt, img_path, use_citys_sparse):
+        if seq_key is None:
+            seq_key = ""
+        if self.last_seq_key is not None and self.last_seq_key != seq_key:
+            self._flush_seq(self.last_seq_key)
+        self.last_seq_key = seq_key
+
+        pred_small = self._downsample(pred)
+        if pred_small is None:
+            return
+        if pred_small.dtype != np.uint8:
+            pred_small = pred_small.astype(np.uint8, copy=False)
+        gt_small = self._downsample(gt) if gt is not None else None
+        if gt_small is not None and gt_small.dtype != np.uint8:
+            gt_small = gt_small.astype(np.uint8, copy=False)
+
+        cache = self.seq_cache.get(seq_key)
+        if cache is None:
+            cache = {
+                "preds": [],
+                "gts": [],
+                "imgs": [],
+                "ref_gt": None,
+                "ref_img": None,
+                "use_citys_sparse": bool(use_citys_sparse),
+            }
+            self.seq_cache[seq_key] = cache
+        else:
+            cache["use_citys_sparse"] = cache["use_citys_sparse"] or bool(use_citys_sparse)
+
+        cache["preds"].append(pred_small)
+        cache["gts"].append(gt_small)
+
+        if use_citys_sparse:
+            img_small = None
+            if img_path:
+                img_small = self._load_small_gray_image(
+                    img_path, pred_small.shape[0], pred_small.shape[1]
+                )
+            cache["imgs"].append(img_small)
+            if gt_small is not None and img_small is not None:
+                cache["ref_gt"] = gt_small
+                cache["ref_img"] = img_small
+
+    def _flush_seq(self, seq_key):
+        cache = self.seq_cache.pop(seq_key, None)
+        if not cache:
+            return
+
+        preds = cache.get("preds", [])
+        gts = cache.get("gts", [])
+        imgs = cache.get("imgs", [])
+        ref_gt = cache.get("ref_gt")
+        ref_img = cache.get("ref_img")
+        use_citys_sparse = cache.get("use_citys_sparse", False)
+
+        if not preds:
+            return
+
+        dense_gt = len(gts) == len(preds) and all(x is not None for x in gts)
+
+        for n in self.mvc_n_list:
+            vc_val = None
+            if dense_gt:
+                vc_val = self._compute_vc_dense(
+                    preds, [x for x in gts if x is not None], n
+                )
+            elif use_citys_sparse:
+                vc_val = self._compute_vc_citys_sparse(preds, imgs, ref_gt, ref_img, n)
+            else:
+                vc_val = self._compute_vc_sparse_by_valid_windows(preds, gts, n)
+            if vc_val is not None and not np.isnan(vc_val):
+                self.mvc_sum[n] += float(vc_val)
+                self.mvc_cnt[n] += 1
+
+    def finalize(self):
+        for seq_key in list(self.seq_cache.keys()):
+            self._flush_seq(seq_key)
+        self.seq_cache.clear()
+        self.last_seq_key = None
+
+
 def _prepare_tmp_dir(save_dir):
     tmp_dir = os.path.join(save_dir, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -320,21 +508,17 @@ def _prepare_tmp_dir(save_dir):
 
 def _resolve_colors(dataset, n_classes, ignore_index):
     colors = getattr(dataset, "colors", None) or getattr(dataset, "COLORS", None)
-    if colors:
-        return colors
     if n_classes == 15:
         if ignore_index and ignore_index > 0:
-            return SSP_COLORS_15
-        return {idx: SSP_COLORS_15[idx + 1] for idx in range(n_classes)}
+            return {0: (0, 0, 0), **{idx + 1: tuple(color) for idx, color in enumerate(PALETTE_15)}}
+        return {idx: tuple(color) for idx, color in enumerate(PALETTE_15)}
+    if colors:
+        return colors
     palette = getattr(dataset, "PALETTE", None)
     if palette:
-        colors = {0: (0, 0, 0)}
-        for idx, color in enumerate(palette[:n_classes]):
-            if ignore_index and ignore_index > 0:
-                colors[idx + 1] = tuple(color)
-            else:
-                colors[idx] = tuple(color)
-        return colors
+        if ignore_index and ignore_index > 0:
+            return {0: (0, 0, 0), **{idx + 1: tuple(color) for idx, color in enumerate(palette[:n_classes])}}
+        return {idx: tuple(color) for idx, color in enumerate(palette[:n_classes])}
     return None
 
 
@@ -379,14 +563,6 @@ def _save_predictions_ssp(pred, rel_path, out_dirs, colors, ignore_index, frame_
     blended_path = os.path.join(out_dirs["blended"], rel_out)
     os.makedirs(os.path.dirname(blended_path), exist_ok=True)
     blended.save(blended_path)
-
-
-def _is_consecutive(dataset, seq_key, prev_frame, curr_frame):
-    if hasattr(dataset, "seq_indices") and seq_key in dataset.seq_indices:
-        idx_map = dataset.seq_indices[seq_key]
-        if prev_frame in idx_map and curr_frame in idx_map:
-            return idx_map[curr_frame] - idx_map[prev_frame] == 1
-    return True
 
 
 def _override_test_pipeline_scale(pipeline, crop_size):
@@ -478,19 +654,25 @@ def main():
         model = MMDataParallel(model, device_ids=[0])
 
     base_model = model.module if hasattr(model, "module") else model
-    base_model.CLASSES = classes
-    base_model.PALETTE = palette
 
     n_classes = len(classes) if classes is not None else cfg.model.decode_head.num_classes
+    if classes is None and n_classes == 15:
+        classes = CLASSES_15
+    if palette is None and n_classes == 15:
+        palette = PALETTE_15
+    base_model.CLASSES = classes
+    base_model.PALETTE = palette
     ignore_index = getattr(dataset, "ignore_index", 255)
     colors = _resolve_colors(dataset, n_classes, ignore_index)
     out_dirs = _prepare_output_dirs(args.save_dir, args.split, args.write_res)
     confusion = torch.zeros((n_classes, n_classes), dtype=torch.int64)
-    tc_sum = torch.tensor(0.0, device="cuda" if torch.cuda.is_available() else "cpu")
-    tc_count = torch.tensor(0.0, device=tc_sum.device)
-
-    raft_weights = os.path.join(SSP_ROOT, "RAFT_core", "raft-things.pth-no-zip")
-    model_raft = get_flow_model(raft_weights).to(tc_sum.device)
+    mvc_tracker = MVCTracker(
+        ignore_index=ignore_index,
+        stride=MVC_STRIDE,
+        mvc_n=MVC_N_LIST,
+        citys_sim_thresh=CITYS_SIM_THRESH,
+    )
+    reduce_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ann_map = {}
     seg_suffix = getattr(dataset, "seg_map_suffix", None)
@@ -506,7 +688,6 @@ def main():
             if rel is not None and seg is not None:
                 ann_map[rel] = seg
 
-    prev_by_seq = {}
     total = len(sampler) if sampler is not None else len(dataset)
     prog_bar = mmcv.ProgressBar(total) if is_main_process() else None
     model.eval()
@@ -517,6 +698,8 @@ def main():
             result = model(return_loss=False, rescale=True, **data)
 
         pred = result[0] if isinstance(result, list) else result
+        if torch.is_tensor(pred):
+            pred = pred.detach().cpu().numpy()
         img_meta = data["img_metas"][0]
         if isinstance(img_meta, list):
             img_meta = img_meta[0]
@@ -529,6 +712,8 @@ def main():
         if not filename and rel_path:
             filename = os.path.join(dataset.img_dir, rel_path)
 
+        pred = pred.astype(np.int64, copy=False)
+        gt = None
         gt_rel = ann_map.get(rel_path)
         if gt_rel is not None:
             gt_path = os.path.join(dataset.ann_dir, gt_rel)
@@ -537,85 +722,101 @@ def main():
                 gt = gt[:, :, 0]
             if gt.shape != pred.shape:
                 gt = mmcv.imresize(gt, pred.shape[::-1], interpolation="nearest")
-            pred = pred.astype(np.int64, copy=False)
             confusion = _update_confusion(confusion, pred, gt, n_classes, ignore_index)
 
-        seq_key = _infer_sequence_key(rel_path)
-        frame_name = os.path.basename(rel_path)
-        try:
-            frame = _load_raw_frame(
-                filename,
-                img_meta.get("img_norm_cfg", {}).get("to_rgb", False),
-                target_hw=EVAL_CROP_SIZE,
-            )
-        except FileNotFoundError:
-            frame = None
+        seq_key = img_meta.get("sequence_key") or _infer_sequence_key(rel_path)
+        use_citys_sparse = _is_cityscapes_sequence(filename or rel_path)
+        mvc_tracker.update(seq_key, pred, gt, filename, use_citys_sparse)
 
         if args.write_res:
             frame_vis = _get_anchor_image(data, img_meta)
-            if frame_vis is None and frame is not None:
-                frame_vis = np.clip(frame.transpose(1, 2, 0), 0, 255).astype(np.uint8)
-                if not img_meta.get("img_norm_cfg", {}).get("to_rgb", True):
-                    frame_vis = frame_vis[..., ::-1]
+            if frame_vis is None and filename:
+                try:
+                    frame = _load_raw_frame(
+                        filename,
+                        img_meta.get("img_norm_cfg", {}).get("to_rgb", False),
+                        target_hw=EVAL_CROP_SIZE,
+                    )
+                except FileNotFoundError:
+                    frame = None
+                if frame is not None:
+                    frame_vis = np.clip(
+                        frame.transpose(1, 2, 0), 0, 255
+                    ).astype(np.uint8)
+                    if not img_meta.get("img_norm_cfg", {}).get("to_rgb", True):
+                        frame_vis = frame_vis[..., ::-1]
             _save_predictions_ssp(
                 pred, rel_path, out_dirs, colors, ignore_index, frame_img=frame_vis
             )
 
-        if frame is not None:
-            pred_tc = pred
-            if pred_tc.shape != EVAL_CROP_SIZE:
-                pred_tc = mmcv.imresize(
-                    pred_tc.astype(np.uint8),
-                    (EVAL_CROP_SIZE[1], EVAL_CROP_SIZE[0]),
-                    interpolation="nearest",
-                ).astype(np.int64)
-            if seq_key in prev_by_seq:
-                prev_frame, prev_pred, prev_name = prev_by_seq[seq_key]
-                if _is_consecutive(dataset, seq_key, prev_name, frame_name):
-                    tc_val = temporal_consistency_pair(
-                        prev_frame,
-                        frame,
-                        prev_pred,
-                        pred_tc,
-                        model_raft,
-                        n_classes,
-                        tc_sum.device,
-                        ignore_index,
-                    )
-                    tc_sum += tc_val.to(tc_sum.device)
-                    tc_count += 1
-            prev_by_seq[seq_key] = (frame, pred_tc, frame_name)
-
         if prog_bar is not None:
             prog_bar.update()
 
-    if distributed:
-        confusion = all_reduce_tensor(confusion.to(tc_sum.device)).cpu()
-        tc_sum = all_reduce_tensor(tc_sum)
-        tc_count = all_reduce_tensor(tc_count)
+    mvc_tracker.finalize()
+    mvc_n_list = list(mvc_tracker.mvc_n_list)
+    mvc_sum = np.array([mvc_tracker.mvc_sum[n] for n in mvc_n_list], dtype=np.float64)
+    mvc_cnt = np.array([mvc_tracker.mvc_cnt[n] for n in mvc_n_list], dtype=np.float64)
 
-    iou, union = _iou_from_confusion(confusion)
-    valid = union > 0
-    global_miou = iou[valid].mean().item() if valid.any() else 0.0
-    per_class_miou = iou.tolist()
-    tc_avg = (tc_sum / tc_count.clamp(min=1)).item()
+    if distributed:
+        confusion = all_reduce_tensor(confusion.to(reduce_device)).cpu()
+        mvc_sum_tensor = all_reduce_tensor(torch.tensor(mvc_sum, device=reduce_device))
+        mvc_cnt_tensor = all_reduce_tensor(torch.tensor(mvc_cnt, device=reduce_device))
+        mvc_sum = mvc_sum_tensor.cpu().numpy()
+        mvc_cnt = mvc_cnt_tensor.cpu().numpy()
+
+    a_acc, m_acc, m_iou, per_class_acc, per_class_iou = _summarize_confusion(
+        confusion.cpu().numpy()
+    )
+    mvc_vals = np.divide(mvc_sum, np.maximum(mvc_cnt, 1.0))
+    mvc_vals = np.where(mvc_cnt > 0, mvc_vals, np.nan)
+
+    a_acc_pct = a_acc * 100.0 if not np.isnan(a_acc) else float("nan")
+    m_acc_pct = m_acc * 100.0 if not np.isnan(m_acc) else float("nan")
+    m_iou_pct = m_iou * 100.0 if not np.isnan(m_iou) else float("nan")
+    per_class_iou_pct = per_class_iou * 100.0
+    per_class_acc_pct = per_class_acc * 100.0
+    mvc_pct = mvc_vals * 100.0
 
     if is_main_process():
+        if base_model.CLASSES:
+            class_names = list(base_model.CLASSES)
+        elif n_classes == 15:
+            class_names = list(CLASSES_15)
+        else:
+            class_names = [f"class_{idx}" for idx in range(n_classes)]
         os.makedirs(args.save_dir, exist_ok=True)
         metrics_path = os.path.join(args.save_dir, f"log_metrics_{args.split}.txt")
         with open(metrics_path, "a") as f:
             f.write(f"Checkpoint: {args.checkpoint}\n")
-            f.write(f"mIoU = {global_miou:.4f}\n")
-            f.write(f"Temporal Consistency = {tc_avg:.4f}\n")
-            f.write("per class mIoU:\n")
-            if base_model.CLASSES:
-                for idx, name in enumerate(base_model.CLASSES):
-                    f.write(f"  {name}: {per_class_miou[idx]:.5f}\n")
-            else:
-                for idx, val in enumerate(per_class_miou):
-                    f.write(f"  class_{idx}: {val:.5f}\n")
+            f.write(f"mIoU = {m_iou_pct:.2f}\n")
+            f.write(f"mAcc = {m_acc_pct:.2f}\n")
+            f.write(f"aAcc = {a_acc_pct:.2f}\n")
+            for n, mvc_val, mvc_count in zip(mvc_n_list, mvc_pct, mvc_cnt):
+                if np.isnan(mvc_val):
+                    f.write(f"mVC{n} = nan (videos={int(mvc_count)})\n")
+                else:
+                    f.write(f"mVC{n} = {mvc_val:.2f} (videos={int(mvc_count)})\n")
+            f.write("per class IoU (%):\n")
+            for idx, name in enumerate(class_names):
+                f.write(f"  {name}: {per_class_iou_pct[idx]:.5f}\n")
+            f.write("per class Acc (%):\n")
+            for idx, name in enumerate(class_names):
+                f.write(f"  {name}: {per_class_acc_pct[idx]:.5f}\n")
             f.write("\n")
-        print(f"mIoU = {global_miou:.4f} | TC = {tc_avg:.4f}")
+        mvc_parts = [
+            f"mVC{n} = {val:.2f}" if not np.isnan(val) else f"mVC{n} = nan"
+            for n, val in zip(mvc_n_list, mvc_pct)
+        ]
+        print(
+            " | ".join(
+                [
+                    f"mIoU = {m_iou_pct:.2f}",
+                    f"mAcc = {m_acc_pct:.2f}",
+                    f"aAcc = {a_acc_pct:.2f}",
+                ]
+                + mvc_parts
+            )
+        )
         print(f"Metrics saved to {metrics_path}")
 
     if dist.is_initialized():
