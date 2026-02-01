@@ -11,6 +11,39 @@ from mmseg.utils import get_root_logger
 from .custom import CustomDataset_cityscape_clips
 
 
+def _normalize_sequence_entry(entry: str) -> str:
+    entry = (entry or "").strip().replace("\\", "/")
+    if not entry:
+        return ""
+    parts = [p for p in entry.split("/") if p]
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+    return "/".join(parts)
+
+
+def _parse_sequence_filter(value):
+    if value is None:
+        return None
+    items = []
+    if isinstance(value, str):
+        items = [v.strip() for v in value.split(",") if v.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                items.extend([v.strip() for v in item.split(",") if v.strip()])
+            else:
+                items.append(str(item))
+    else:
+        items = [str(value)]
+    normalized = [_normalize_sequence_entry(item) for item in items]
+    normalized = [item for item in normalized if item]
+    if not normalized:
+        return None
+    return set(normalized)
+
+
 @DATASETS.register_module()
 class CityscapesCorruptionsDataset_clips(CustomDataset_cityscape_clips):
     """Cityscapes sequence corruptions dataset for clip-based evaluation."""
@@ -72,6 +105,8 @@ class CityscapesCorruptionsDataset_clips(CustomDataset_cityscape_clips):
         gene_prototype=False,
         mamba_mode=False,
         corruption=None,
+        sequence_filter=None,
+        sequence_filters=None,
     ):
         if istraining is None:
             istraining = split == 'train' and not test_mode
@@ -81,6 +116,9 @@ class CityscapesCorruptionsDataset_clips(CustomDataset_cityscape_clips):
                 img_dir = osp.join(img_dir, corruption)
 
         self.corruption = corruption
+        self.sequence_filter = _parse_sequence_filter(
+            sequence_filter if sequence_filter is not None else sequence_filters
+        )
         self._group_by_camera = group_by_camera
         self.split_name = split
         split_for_super = None
@@ -186,6 +224,10 @@ class CityscapesCorruptionsDataset_clips(CustomDataset_cityscape_clips):
         missing = 0
         for info in self.img_infos:
             seq_dir, seq_key, frame = self._sequence_key_from_relpath(info['filename'])
+            if self.sequence_filter:
+                seq_norm = _normalize_sequence_entry(seq_dir)
+                if seq_norm not in self.sequence_filter:
+                    continue
             if seq_key not in self.seq_indices:
                 missing += 1
                 continue

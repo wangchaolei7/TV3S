@@ -117,6 +117,31 @@ def parse_args():
         action="store_true",
         help="No-op (metrics are always computed); kept for compatibility.",
     )
+    parser.add_argument(
+        "--city-root-images",
+        default=None,
+        help="Root folder for Cityscapes sequence images",
+    )
+    parser.add_argument(
+        "--city-root-labels",
+        default=None,
+        help="Root folder for Cityscapes gtFine labels",
+    )
+    parser.add_argument(
+        "--corruption",
+        default=None,
+        help="Cityscapes corruption name (e.g. fog, snow, origin_leftImg8bit_sequence)",
+    )
+    parser.add_argument(
+        "--city-seq",
+        default=None,
+        help="Single Cityscapes sequence (e.g. munster/seq173 or absolute path)",
+    )
+    parser.add_argument(
+        "--city-seqs",
+        default=None,
+        help="Comma-separated Cityscapes sequences",
+    )
     parser.set_defaults(write_res=False)
     return parser.parse_args()
 
@@ -204,6 +229,63 @@ def _summarize_confusion(confusion):
         m_acc = float("nan")
         m_iou = float("nan")
     return a_acc, m_acc, m_iou, acc, iou
+
+
+
+
+def _normalize_seq_filters(city_seq, city_seqs):
+    raw = []
+    if city_seq:
+        raw.append(city_seq)
+    if city_seqs:
+        raw.extend([c.strip() for c in city_seqs.split(",") if c.strip()])
+    if not raw:
+        return None
+    filters = set()
+    for item in raw:
+        if not item:
+            continue
+        norm = str(item).strip().replace("\\", "/").rstrip("/")
+        if not norm:
+            continue
+        parts = [p for p in norm.split("/") if p]
+        if not parts:
+            continue
+        if "cityscapes_sequence" in norm:
+            if len(parts) >= 2:
+                filters.add("/".join(parts[-2:]))
+            filters.add(parts[-1])
+        elif parts[-1] in ("image_00", "image_01"):
+            if len(parts) >= 2:
+                filters.add(parts[-2])
+                filters.add("/".join(parts[-2:]))
+            else:
+                filters.add(parts[-1])
+        else:
+            filters.add(parts[-1])
+            if len(parts) >= 2:
+                filters.add("/".join(parts[-2:]))
+    return filters or None
+
+
+def _sequence_key_from_info(info):
+    rel = info.get("sequence_key") or _infer_sequence_key(info.get("filename"))
+    return (rel or "").replace("\\", "/").strip("/")
+
+
+def _matches_sequence(seq_key, filters):
+    if not filters:
+        return True
+    if not seq_key:
+        return False
+    if seq_key in filters:
+        return True
+    for filt in filters:
+        if not filt:
+            continue
+        if seq_key.startswith(filt + "/") or seq_key.endswith("/" + filt):
+            return True
+    return False
 
 
 def _infer_sequence_key(rel_path):
@@ -637,11 +719,34 @@ def main():
         data_cfg = data_cfg["dataset"]
     data_cfg = mmcv.ConfigDict(data_cfg)
     data_cfg.test_mode = True
+    data_type = str(data_cfg.get("type", "")).lower()
+    if args.corruption:
+        data_cfg.corruption = args.corruption
+    if args.city_root_images:
+        data_cfg.img_dir = args.city_root_images
+    if args.city_root_labels:
+        data_cfg.ann_dir = args.city_root_labels
+    if (args.city_seq or args.city_seqs) and "cityscapes" in data_type:
+        seqs = []
+        if args.city_seq:
+            seqs.append(args.city_seq)
+        if args.city_seqs:
+            seqs.append(args.city_seqs)
+        data_cfg.sequence_filter = seqs
     if hasattr(data_cfg, "pipeline"):
         _override_test_pipeline_scale(data_cfg.pipeline, EVAL_CROP_SIZE)
     if hasattr(cfg.data, "test"):
         cfg.data.test.test_mode = True
     dataset = build_dataset(data_cfg)
+
+    seq_filters = _normalize_seq_filters(args.city_seq, args.city_seqs)
+    if seq_filters and hasattr(dataset, "img_infos"):
+        filtered = []
+        for info in dataset.img_infos:
+            seq_key = _sequence_key_from_info(info)
+            if _matches_sequence(seq_key, seq_filters):
+                filtered.append(info)
+        dataset.img_infos = filtered
 
     sampler = SequenceDistributedSampler(dataset, world_size=world_size, rank=rank) if distributed else None
     data_loader = DataLoader(
