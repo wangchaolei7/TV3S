@@ -6,4 +6,5 @@ from .apollo import *
 from .kitti360 import *
 from .camvid import *
 from .cityscapes_corruptions import *
+from .folder_sequence import *
 from .vspw import *

@@ -118,6 +118,26 @@ def parse_args():
         help="No-op (metrics are always computed); kept for compatibility.",
     )
     parser.add_argument(
+        "--root-images",
+        default=None,
+        help="Generic image root override for folder-sequence datasets",
+    )
+    parser.add_argument(
+        "--root-labels",
+        default=None,
+        help="Generic label root override for folder-sequence datasets",
+    )
+    parser.add_argument(
+        "--sequence",
+        default=None,
+        help="Single sequence to evaluate",
+    )
+    parser.add_argument(
+        "--sequences",
+        default=None,
+        help="Comma-separated sequences to evaluate",
+    )
+    parser.add_argument(
         "--city-root-images",
         default=None,
         help="Root folder for Cityscapes sequence images",
@@ -719,27 +739,34 @@ def main():
         data_cfg = data_cfg["dataset"]
     data_cfg = mmcv.ConfigDict(data_cfg)
     data_cfg.test_mode = True
-    data_type = str(data_cfg.get("type", "")).lower()
+    override_img_dir = args.root_images or args.city_root_images
+    override_ann_dir = args.root_labels or args.city_root_labels
+    seq_args = []
+    if args.sequence:
+        seq_args.append(args.sequence)
+    if args.sequences:
+        seq_args.append(args.sequences)
+    if args.city_seq:
+        seq_args.append(args.city_seq)
+    if args.city_seqs:
+        seq_args.append(args.city_seqs)
     if args.corruption:
         data_cfg.corruption = args.corruption
-    if args.city_root_images:
-        data_cfg.img_dir = args.city_root_images
-    if args.city_root_labels:
-        data_cfg.ann_dir = args.city_root_labels
-    if (args.city_seq or args.city_seqs) and "cityscapes" in data_type:
-        seqs = []
-        if args.city_seq:
-            seqs.append(args.city_seq)
-        if args.city_seqs:
-            seqs.append(args.city_seqs)
-        data_cfg.sequence_filter = seqs
+    if override_img_dir:
+        data_cfg.img_dir = override_img_dir
+    if override_ann_dir:
+        data_cfg.ann_dir = override_ann_dir
+    if seq_args:
+        data_cfg.sequence_filter = seq_args
     if hasattr(data_cfg, "pipeline"):
         _override_test_pipeline_scale(data_cfg.pipeline, EVAL_CROP_SIZE)
     if hasattr(cfg.data, "test"):
         cfg.data.test.test_mode = True
     dataset = build_dataset(data_cfg)
 
-    seq_filters = _normalize_seq_filters(args.city_seq, args.city_seqs)
+    seq_filters = _normalize_seq_filters(
+        args.sequence or args.city_seq, args.sequences or args.city_seqs
+    )
     if seq_filters and hasattr(dataset, "img_infos"):
         filtered = []
         for info in dataset.img_infos:
